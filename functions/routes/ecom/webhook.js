@@ -31,9 +31,113 @@ exports.post = ({ appSdk }, req, res) => {
       }
 
       /* DO YOUR CUSTOM STUFF HERE */
+      const { resource } = trigger
+      if ((resource === 'orders' || resource === 'carts') && trigger.action !== 'delete') {
+        const resourceId = trigger.resource_id || trigger.inserted_id
+        if (resourceId && appData.rd_token) {
+          const url = 'https://api.rd.services/platform/events'
+          console.log(`Trigger for Store #${storeId} ${resourceId} => ${url}`)
+          if (url) {
+            appSdk.apiRequest(storeId, `${resource}/${resourceId}.json`)
+              .then(async ({ response }) => {
+                let customer
+                const body = response.data
+                if (resource === 'carts') {
+                  const cart = body
+                  if (cart.available && !cart.completed) {
+                    const abandonedCartDelay = 12 * 1000 * 60
+                    if (Date.now() - new Date(cart.created_at).getTime() >= abandonedCartDelay) {
+                      const { customers } = cart
+                      if (customers && customers[0]) {
+                        const { response } = await appSdk.apiRequest(storeId, `customers/${customers[0]}.json`)
+                        customer = response.data
+                      }
+                    } else {
+                      return res.sendStatus(501)
+                    }
+                  } else {
+                    return res.sendStatus(204)
+                  }
+                }
+                if (resource === 'orders') {
+                  const { buyers } = body
+                  if (buyers && buyers[0]) {
+                    const { response } = await appSdk.apiRequest(storeId, `customers/${buyers[0]}.json`)
+                    customer = response.data
+                  }
+                }
+                console.log(`> Sending ${resource} notification`)
+                let data
+                if (resource === 'orders') {
+                  const financial = body && body.financial_status.current
+                  const totalItems = body.items.length
+                  const transaction = body.transactions[0]
+                  const getMethod = transaction => {
+                    const paymentMethod = transaction.payment_method && transaction.payment_method.code
+                    if (paymentMethod === 'credit_card') {
+                      return 'Credit Card'
+                    } else {
+                      return 'Others'
+                    }
+                  }
+                  const paymentMethod = getMethod(transaction)
+                  const total = body.amount && body.amount.total
+                  const acceptedMarketing = body.accepts_marketing ? 'granted' : 'declined'
+                  data = {
+                    "event_type": "ORDER_PLACED",
+                    "event_family":"CDP",
+                    "payload": {
+                      "name": customer.display_name,
+                      "email": customer.main_email,
+                      "cf_order_id": body._id,
+                      "cf_order_total_items": totalItems,
+                      "cf_order_status": financial,
+                      "cf_order_payment_method": paymentMethod,
+                      "cf_order_payment_amount": total,
+                      "legal_bases": [
+                        {
+                          "category": "communications",
+                          "type":"consent",
+                          "status": acceptedMarketing
+                        }
+                      ]
+                    }
+                  }
+                } else if (resource === 'carts') {
 
-      // all done
-      res.send(ECHO_SUCCESS)
+                }
+                return axios({
+                  method: 'post',
+                  url,
+                  data: data
+                })
+              })
+              .then(({ status }) => console.log(`> ${status}`))
+              .catch(error => {
+                if (error.response && error.config) {
+                  const err = new Error(`#${storeId} ${resourceId} POST to ${url} failed`)
+                  const { status, data } = error.response
+                  err.response = {
+                    status,
+                    data: JSON.stringify(data)
+                  }
+                  err.data = JSON.stringify(error.config.data)
+                  return console.error(err)
+                }
+                console.error(error)
+              })
+              .finally(() => {
+                if (!res.headersSent) {
+                  return res.sendStatus(200)
+                }
+              })
+          }
+        }
+      }
+    
+      if (resource !== 'carts') {
+        res.sendStatus(201)
+      }
     })
 
     .catch(err => {
